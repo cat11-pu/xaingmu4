@@ -1,6 +1,7 @@
 """orset 测试：add-wins 语义、merge 三大律、快照隔离、并发安全。"""
 
 import random
+import sys
 import threading
 
 import pytest
@@ -341,3 +342,144 @@ def test_concurrent_bidirectional_merge_no_deadlock():
     a.merge(b)
     b.merge(a)
     assert a.elements() == b.elements()
+
+
+# ---------- 墓碑回收（GC） ----------
+
+def _state_size(r):
+    """统计副本内部 adds/removes 状态占用的字节（dict/set/键/字符串）。"""
+    seen = set()
+
+    def sizeof(obj):
+        if id(obj) in seen:
+            return 0
+        seen.add(id(obj))
+        total = sys.getsizeof(obj)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                total += sizeof(k) + sizeof(v)
+        elif isinstance(obj, (set, frozenset, list, tuple)):
+            for item in obj:
+                total += sizeof(item)
+        return total
+
+    return sizeof(r._adds) + sizeof(r._removes)
+
+
+def test_gc_single_replica_frees_all_garbage():
+    s = ORSet("solo")
+    for i in range(500):
+        s.add(i)
+        s.remove(i)
+    assert s.elements() == set()
+    # 只有自己一个存活副本：tag 一进 removes 即被全副本确认，彻底回收
+    assert s._adds == {}
+    assert s._removes == {}
+
+
+def test_gc_keeps_tombstone_while_peer_holds_add():
+    a = ORSet("A")
+    b = ORSet("B")
+    a.add("x")
+    a.merge(b)            # b 的 adds 里也持有该 tag
+    b.merge(a)
+    a.remove("x")         # b 还没收到墓碑，仍持有 add(tag)
+    assert "x" in a._removes   # 不能回收，否则 b 的 add 会让 x 复活
+    b.merge(a)                # b 收到墓碑，摘除本地死 tag
+    a.merge(b)                # 全球再无 add(tag)，触发全量回收
+    assert a._removes == {}
+    assert b._removes == {}
+    assert a.elements() == b.elements() == set()
+
+
+def test_gc_immediate_when_no_peer_ever_held_add():
+    a = ORSet("A")
+    b = ORSet("B")          # 一直活着，但从没见过 x
+    a.add("x")
+    a.remove("x")           # 全球只有 a 持有过 tag，已随墓碑抵消
+    assert a._removes == {}  # 立即回收是安全的：b 无 add 可传播
+    assert a.elements() == b.elements() == set()
+
+
+def test_gc_safe_with_concurrent_add_wins():
+    """GC 不能破坏 add-wins：未被全部确认的墓碑不能挡住后来的新 tag。"""
+    a = ORSet("A")
+    b = ORSet("B")
+    a.add("x")
+    a.merge(b)             # b 见过初始 tag t1
+    b.merge(a)
+    a.remove("x")          # a 删 t1；b 仍持有 add(t1)，墓碑必须保留
+    assert "x" in a._removes
+    b.add("x")            # b 并发 add 全新 tag t2
+    a.merge(b)            # a 拿到 t2（add 赢）；t1 被本地墓碑立即抵消
+    assert a.lookup("x")
+    b.merge(a)            # b 收到 t1 墓碑并摘除 t1；t1 从此全球灭绝
+    a.merge(b)            # 全量 GC：t1 墓碑回收，t2 保留
+    assert a.elements() == b.elements() == {"x"}
+    assert a._removes == {} and b._removes == {}
+    assert a.lookup("x") and b.lookup("x")
+    # 再删 t2：两边同步摘除、全网无持有者后，t2 墓碑同样被回收
+    a.remove("x")
+    assert a.lookup("x") is False
+    assert b.lookup("x")          # b 还持有 t2（merge 是单向的）
+    b.merge(a)
+    b._gc()
+    a.merge(b)
+    assert not a.lookup("x") and not b.lookup("x")
+    assert a._removes == {} and b._removes == {}
+
+
+def test_gc_offline_peer_then_reconnect():
+    """离线副本仍持有 add(tag) 期间墓碑不回收；重连同步后再回收。"""
+    a = ORSet("A")
+    offline = ORSet("offline")
+    a.add("x")
+    a.merge(offline)          # offline 持有 add(tag) 后离线
+    offline.merge(a)
+    a.remove("x")
+    assert "x" in a._removes  # offline 还活着且持有 tag，不能回收
+    assert offline.lookup("x")
+    # offline 重连：收到墓碑，x 消失；随后双向同步使墓碑被安全回收
+    offline.merge(a)
+    assert not offline.lookup("x")
+    a.merge(offline)
+    assert a._removes == {} and offline._removes == {}
+
+
+def test_gc_after_peer_dies():
+    """副本被解释器回收后自动退出确认集合，不再阻碍 GC。"""
+    import gc as gc_mod
+    import weakref
+
+    a = ORSet("A")
+    ephemeral = ORSet("ep")
+    a.add("x")
+    a.merge(ephemeral)
+    ephemeral.merge(a)
+    a.remove("x")             # ephemeral 还持有 tag，先保留
+    assert "x" in a._removes
+    ref = weakref.ref(ephemeral)
+    del ephemeral
+    gc_mod.collect()
+    assert ref() is None
+    a._gc()                   # 持有 tag 的副本已不存在 -> 回收
+    assert a._removes == {}
+    assert a.elements() == set()
+    # 此后新增/删除/回收依旧正常
+    a.add("y")
+    a.remove("y")
+    assert a._removes == {}
+    assert a.elements() == set()
+
+
+def test_gc_concurrent_workload_reclaims_memory():
+    """20k 次增删（单副本），结束后内部状态应被回收到接近空集水平。"""
+    s = ORSet("bulk")
+    for i in range(20_000):
+        s.add(i)
+        s.remove(i)
+    assert s.elements() == set()
+    assert s._adds == {} and s._removes == {}
+    # 空状态只剩 dict 自身的固定容量（CPython 大量增删后保留小哈希表，
+    # 但仍是与 20k 无关的常量），而不是 MB 级垃圾
+    assert _state_size(s) < 1024

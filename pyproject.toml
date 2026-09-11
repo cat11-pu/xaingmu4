@@ -17,3 +17,6 @@ packages = ["orset"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 让裸 `pytest -q` 与 `python -m pytest` 一样能从仓库根目录导入 orset，
+# 无需先 pip install -e .
+pythonpath = ["."]
