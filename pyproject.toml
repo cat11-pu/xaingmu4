@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orset"
+version = "0.0.0"
+description = "Add-wins OR-Set CRDT with commutative, associative and idempotent merge"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["orset"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
